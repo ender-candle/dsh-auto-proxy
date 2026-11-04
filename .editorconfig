@@ -1,0 +1,12 @@
+root = true
+
+# 统一 UTF-8 且不带 BOM：DSH 与 node 都会用 JSON.parse 读 package.json，
+# 一个 BOM 就会让整行插件变成「包不可用 / Unexpected token」。
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+trim_trailing_whitespace = false

@@ -1,4 +1,4 @@
-﻿import test from "node:test";
+import test from "node:test";
 import assert from "node:assert/strict";
 import { parseRegValues, parseProxyServer, parseBypassList } from "../lib/system-proxy.js";
 import { hostnameOf, matchesHost, parseTarget } from "../lib/hosts.js";

@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-auto-proxy",
   "version": "0.2.0",
   "description": "Three-switch network proxy for DeepSeek Harness: proxy search, LLM and general web traffic independently, and drop to a direct connection the moment the system proxy is turned off.",
