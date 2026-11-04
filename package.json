@@ -1,0 +1,53 @@
+{
+  "name": "dsh-auto-proxy",
+  "version": "0.1.0",
+  "description": "Three-switch network proxy for DeepSeek Harness: proxy search, LLM and general web traffic independently, and drop to a direct connection the moment the system proxy is turned off.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "proxy",
+    "system-proxy",
+    "network"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "node test/unit.test.mjs",
+    "test:e2e": "node test/tunnel.e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "react"
+      ]
+    },
+    "engines": {
+      "dsh": ">=0.2.0-rc.1"
+    }
+  }
+}

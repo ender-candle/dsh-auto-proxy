@@ -1,0 +1,19 @@
+# dsh-auto-proxy — 三开关网络代理
+# 「搜索走代理」「LLM 走代理」「网页走代理」三个开关各自独立。
+#
+#   搜索 = 找：打搜索引擎 / 搜索服务的接口（Bing、Google、Exa、Tavily…）
+#   LLM  = 想：打模型网关（自动从 provider 的 baseURL 发现）
+#   网页 = 读：打开搜索结果里的网页、抓取页面，以及其余非搜索非 LLM 的请求
+#
+# 三个开关都关 = 全部直连；系统代理一关，无论开关如何都立刻全部直连。
+- insert:
+    - id: auto-proxy
+      name: 'dsh-auto-proxy'
+      config:
+        proxySearch: false
+        proxyLLM: false
+        proxyWeb: false
+        noProxy:
+          - 127.0.0.1
+          - localhost
+          - ::1
