@@ -154,6 +154,22 @@ lib/proxy/            HTTP CONNECT / SOCKS5 / HTTP2 传输实现
 test/                 单测与端到端自检
 ```
 
+## 更新日志
+
+### 0.2.0
+
+**修复：桌面端设置页一直显示"正在读取系统代理"、开关点了没反应。**
+
+原因是页面用根相对路径 `fetch("/_dsh/auto-proxy")` 读配置。DSH 桌面端的渲染进程 origin 是
+`dsh-app://app`，该路径被解析成 `dsh-app://app/_dsh/auto-proxy`，落到 Electron 的协议处理器上返回
+**200 + 空 body**，`res.json()` 抛错后页面就一直停在初始状态；同时点击也被"没有数据就不响应"的逻辑挡住。
+
+改为走 DSH 官方的 `ctx.configForms` RPC 通道（`getSnapshot()` / `mutate(ops, revision)`），
+与 DSH 自己的设置页同一条路，桌面端与浏览器端都可工作。另外：
+
+- 修掉错误行把数组当 React children 渲染的 bug —— 之前**即使出错也看不到任何提示**；
+- 页面底部新增「诊断信息」，直接显示宿主返回的快照，便于定位；
+- 宿主侧 `/_dsh/auto-proxy` 路由保留（`dsh web` 浏览器模式仍可用），并补上 CORS 与 OPTIONS 预检。
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
