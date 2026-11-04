@@ -170,6 +170,30 @@ test/                 单测与端到端自检
 - 修掉错误行把数组当 React children 渲染的 bug —— 之前**即使出错也看不到任何提示**；
 - 页面底部新增「诊断信息」，直接显示宿主返回的快照，便于定位；
 - 宿主侧 `/_dsh/auto-proxy` 路由保留（`dsh web` 浏览器模式仍可用），并补上 CORS 与 OPTIONS 预检。
+## FAQ
+
+**Q：开了「网页走代理」之后，DSH 的「思考过程翻译」显示「翻译暂不可用」？**
+
+翻译插件（`dsh-experimental-translator`）用的是免登录端点：
+
+- Bing：`https://edge.microsoft.com/translate/translatetext`（默认）
+- Google：`https://translate.googleapis.com/...`
+
+`edge.microsoft.com` 不在本插件内置的搜索域名表里，会被归到「网页」类；一旦网页类走代理，
+这个免登录端点从境外 IP 访问通常会被风控，于是翻译失败。修法是把该主机排除出代理：
+
+```yaml
+config:
+  noProxy:
+    - 127.0.0.1
+    - localhost
+    - ::1
+    - edge.microsoft.com   # Bing 免登录翻译端点，必须直连
+```
+
+反过来，如果你用 **Google** 翻译服务，`translate.googleapis.com` 在中国大陆直连不通，
+**不要**把它加进 `noProxy`，让它继续走代理才对。
+
 ## License
 
 MIT，见 [LICENSE](LICENSE)。
