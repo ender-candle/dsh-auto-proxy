@@ -18,12 +18,21 @@
   ],
   "keywords": [
     "deepseek",
-    "harness",
+    "deepseek-harness",
     "dsh",
     "dsh-plugin",
+    "cordis",
+    "agent",
     "proxy",
     "system-proxy",
-    "network"
+    "network-proxy",
+    "http-proxy",
+    "socks5",
+    "network",
+    "windows",
+    "web-search",
+    "llm",
+    "plugin"
   ],
   "license": "MIT",
   "scripts": {
