@@ -137,6 +137,7 @@ node test/tunnel.e2e.mjs     # 起一个本地最小 CONNECT 代理，验证隧�
 已验证：
 
 - 单测全部通过，覆盖：系统代理关闭 → `enabled=false`（本插件与"手填兜底"的分歧点）、搜索域名识别、
+  **volatile 开关必须读 `.get()`（直接取引用恒为 true，正是 0.2.4 修的 bug）**、
   `api.deepseek.com` 上按路径区分 `tools/search`（搜索）与 `chat/completions`（LLM）、
   图像端点（`/v1/images/edits`）即使网关未发现也归 LLM、`openaiCompatBaseURL` 这类带前缀的键名能被发现、
   `FormData`/`URLSearchParams`/字符串的编码与 content-type、转发不了的请求体退回直连（且只提示一次）、
@@ -170,6 +171,7 @@ cordis.patch.yml      插件行声明
 lib/index.js          入口：schema、系统代理轮询、按类别路由、fetch 装/拆
 lib/classify.js       请求归类（搜索 / LLM / 网页）、图像端点与三开关决策
 lib/hosts.js          主机名解析与后缀匹配
+lib/config-value.js   读取配置字段真实值（volatile 字段是 { get() } 引用，必须解引用）
 lib/provider-hosts.js 从 DSH 设置里发现模型网关主机（baseURL 键名宽松识别）
 lib/system-proxy.js   读取系统代理（Windows 注册表 / macOS scutil / Linux env）
 lib/proxy-fetch.js    代理客户端入口
@@ -178,6 +180,28 @@ test/                 单测与端到端自检
 ```
 
 ## 更新日志
+
+### 0.2.4
+
+**修复：三个开关从来没真正生效过（`/_dsh/auto-proxy` 永远显示三个都是 `true`，
+界面上点了也没反应，用户从没开过「LLM 走代理」却显示开着）。**
+
+三个开关都声明了 `.volatile()`，而 schemastery 会把 volatile 字段在
+`apply(ctx, config)` 里换成 cosmokit 的引用对象 `{ get(): T }`，**不是原始值**。
+旧代码直接 `!!cfg.proxyLLM` / `Boolean(config.proxyLLM)`——对象恒真，于是：
+
+- 路由里三个开关永远"开着"→ 只要系统代理可用，**什么请求都走代理**（搜索/LLM/网页全走）；
+- `/_dsh/auto-proxy` 的 `snapshotConfig()` 永远返回三个 `true`；
+- 界面上改开关只更新了引用的值，宿主从没读过 `.get()` → 等于点了没反应；
+- 「网页开关未开」的提示分支永远进不去。
+
+修复：新增 `lib/config-value.js`，`readConfigField(ref, fallback)` 统一解引用
+（volatile 取 `.get()`，普通字段原样），`readSwitches(config)` 现读三个开关；
+所有读取点（路由、快照、日志、超时、轮询间隔）都改用它。另外启动即安装 fetch 包装器
+（路由按请求决策），所以**开关改动现在即时生效**，不需要再靠系统代理状态变化来触发。
+
+> 行为变化提示：升级后开关才第一次真正起作用。之前"什么都走代理"是因为开关失灵，
+> 不是设计如此；需要走代理的类别请显式打开对应开关。
 
 ### 0.2.3
 
@@ -242,6 +266,12 @@ proxiedFetch: unsupported request body type: FormData`）。
 - 页面底部新增「诊断信息」，直接显示宿主返回的快照，便于定位；
 - 宿主侧 `/_dsh/auto-proxy` 路由保留（`dsh web` 浏览器模式仍可用），并补上 CORS 与 OPTIONS 预检。
 ## FAQ
+
+**Q：三个开关显示全是开着的 / 我从来没开过「LLM 走代理」却显示开着 / 点了开关没反应？**
+
+0.2.4 已修。开关是 `.volatile()` 字段，DSH 在 `apply` 里给到的是 `{ get(): T }` 引用对象，
+旧版本按布尔用，对象恒真 → 三个开关全失效、接口永远返回 `true`、界面改动不生效。
+升级后 `readSwitches()` 每次现读 `.get()`，开关即时生效。
 
 **Q：图生图报 `Error [ETIMEOUT]: HTTP/2 request timeout after 60000ms`？**
 

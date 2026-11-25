@@ -4,6 +4,7 @@ import { parseRegValues, parseProxyServer, parseBypassList } from "../lib/system
 import { hostnameOf, matchesHost, parseTarget } from "../lib/hosts.js";
 import { classify, isSearchPath, isModelPath, decideProxy } from "../lib/classify.js";
 import { providerHostsFrom, isBaseUrlKey } from "../lib/provider-hosts.js";
+import { readConfigField, readSwitches } from "../lib/config-value.js";
 import { normalizeBody, proxiedFetch } from "../lib/proxy/request.js";
 
 const SAMPLE = `
@@ -113,6 +114,46 @@ test("classify：图像端点归 LLM，不依赖网关主机是否被发现", ()
   assert.equal(classify("relay.unknown.example", "/v1/chat/completions", {}), "web");
   // 发现到主机之后，整台网关都是 LLM
   assert.equal(classify("relay.unknown.example", "/v1/chat/completions", { llmHosts: ["relay.unknown.example"] }), "llm");
+});
+
+test("readSwitches：volatile 开关必须读 .get()，否则对象恒真", () => {
+  // 回归：三个开关都声明了 .volatile()，schemastery 会把它们换成 { get() } 引用。
+  // 之前直接 !!cfg.proxyLLM，于是永远为 true —— 开关全失效、接口永远显示开着。
+  const volatile = (value) => ({ get: () => value });
+  const allOff = { proxySearch: volatile(false), proxyLLM: volatile(false), proxyWeb: volatile(false) };
+  assert.equal(Boolean(allOff.proxyLLM), true, "直接取引用恒为真（这正是原来的 bug）");
+  assert.deepEqual(readSwitches(allOff), { proxySearch: false, proxyLLM: false, proxyWeb: false });
+
+  assert.deepEqual(readSwitches({ proxySearch: volatile(true), proxyLLM: volatile(false), proxyWeb: volatile(true) }), {
+    proxySearch: true,
+    proxyLLM: false,
+    proxyWeb: true,
+  });
+
+  // 非 volatile 字段仍是原始值
+  assert.deepEqual(readSwitches({ proxySearch: true, proxyLLM: false, proxyWeb: true }), {
+    proxySearch: true,
+    proxyLLM: false,
+    proxyWeb: true,
+  });
+  // 缺字段 / 引用值为 undefined → false
+  assert.deepEqual(readSwitches({}), { proxySearch: false, proxyLLM: false, proxyWeb: false });
+  assert.deepEqual(readSwitches({ proxyLLM: volatile(undefined) }), { proxySearch: false, proxyLLM: false, proxyWeb: false });
+
+  // readConfigField：普通值、引用、缺省
+  assert.equal(readConfigField(60000, 1), 60000);
+  assert.equal(readConfigField(volatile(3000), 1), 3000);
+  assert.equal(readConfigField(volatile(undefined), 1), 1);
+  assert.equal(readConfigField(undefined, 1), 1);
+});
+
+test("decideProxy：开关真实值关闭时不该走代理", () => {
+  const volatile = (value) => ({ get: () => value });
+  const cfg = { proxySearch: volatile(true), proxyLLM: volatile(false), proxyWeb: volatile(false) };
+  const switches = readSwitches(cfg);
+  assert.equal(decideProxy("search", switches), true);
+  assert.equal(decideProxy("llm", switches), false, "LLM 开关没开，生图请求不该被代理");
+  assert.equal(decideProxy("web", switches), false);
 });
 
 test("providerHostsFrom：带插件前缀的 baseURL 键名也要认得", () => {
