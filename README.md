@@ -49,12 +49,16 @@ web_fetch("https://reuters.com/…") →  打 reuters.com       →  归类「�
 |---|---|---|
 | 1 | 路径是 `/tools/search`、`/tools/fetch`（DeepSeek 的 Search/Fetch 端点） | 搜索 |
 | 2 | 主机命中搜索域名（内置列表 + `searchHosts`） | 搜索 |
-| 3 | 主机命中模型网关（自动发现 + `llmHosts`） | LLM |
-| 4 | 其余 | 网页 |
+| 3 | 路径是模型网关的图像端点（`/v1/images/generations`、`/images/edits` 等） | LLM |
+| 4 | 主机命中模型网关（自动发现 + `llmHosts`） | LLM |
+| 5 | 其余 | 网页 |
 
 内置搜索域名：`bing.com`、`google.com`、`duckduckgo.com`、`search.brave.com`、`startpage.com`、`ecosia.org`、`mojeek.com`、`yandex.com`、`baidu.com`、`sogou.com`、`so.com`、`exa.ai`、`tavily.com`、`keenable.ai`、`firecrawl.dev`、`parallel.ai`、`perplexity.ai`、`serper.dev`、`serpapi.com`、`serply.io`、`you.com`、`jina.ai`、`zhihu.com`、`toutiao.com`。自建 SearXNG、内网搜索请用 `searchHosts` 追加。
 
-模型网关默认**自动发现**：插件从 DSH 设置里读出所有 provider 的 `baseURL` 主机名（比如你配的第三方中转），不用手填；发现不到时日志会提示，用 `llmHosts` 补。
+模型网关默认**自动发现**：插件从 DSH 设置里读出所有 provider 的网关地址主机名（比如你配的第三方中转），不用手填。键名按后缀宽松识别——`baseURL`、`base_url`、`apiBase`、`api_base`，以及各插件带前缀的写法（`openaiCompatBaseURL`、`imageBaseURL` 之类）都算。发现不到时日志会留一行线索，用 `llmHosts` 补。
+
+> 第 3 条是为图像端点准备的兜底：图生图（multipart 发 `/v1/images/edits`）和对话走同一个网关，
+> 但网关主机若没被发现，它就会掉进「网页」类，被「网页走代理」开关带走。路径判据不依赖配置。
 
 ## 安装
 
@@ -110,12 +114,19 @@ dsh plugin --profile <你的profile> add github:<你的用户名>/dsh-auto-proxy
 
 **协议**：HTTP / HTTPS CONNECT；注册表里只写了 `socks=` 时走 SOCKS5（支持 RFC1929 账号密码）。
 
+**请求体**：代理层自己拼 HTTP 报文，请求体得先变成字节。支持 `string`、`Buffer`、TypedArray、`Blob`、
+`URLSearchParams`、`FormData`（`multipart` 会带上同一个 boundary 的 content-type）、Node 流；
+**转发不了的请求体（例如 Web `ReadableStream`）自动退回直连**——代理只该是「尽力绕行」，
+绝不该让本来能成功的请求失败（包装的是全进程 `fetch`，一次误伤就是某个插件功能整体失效）。
+`FormData` 会整体编码进内存一次（几 MB 的图片没问题，超大上传请留意内存）。
+
 **平台**：Windows（注册表）、macOS（`scutil --proxy`）、Linux（`HTTPS_PROXY` 等环境变量）。
 
 ## 自检
 
 ```bash
-node test/unit.test.mjs      # 纯函数单测：注册表解析、主机匹配、请求归类、三开关决策
+node test/unit.test.mjs      # 纯函数单测：注册表解析、主机匹配、请求归类、请求体编码、三开关决策
+node test/bodies.e2e.mjs     # 本地闭环（不联网）：起最小 forward proxy + origin，验证 FormData/JSON/字符串/表单经代理完整送达
 node test/tunnel.e2e.mjs     # 起一个本地最小 CONNECT 代理，验证隧道链路（需联网）
 ```
 
@@ -123,8 +134,13 @@ node test/tunnel.e2e.mjs     # 起一个本地最小 CONNECT 代理，验证隧�
 
 - 单测全部通过，覆盖：系统代理关闭 → `enabled=false`（本插件与"手填兜底"的分歧点）、搜索域名识别、
   `api.deepseek.com` 上按路径区分 `tools/search`（搜索）与 `chat/completions`（LLM）、
+  图像端点（`/v1/images/edits`）即使网关未发现也归 LLM、`openaiCompatBaseURL` 这类带前缀的键名能被发现、
+  `FormData`/`URLSearchParams`/字符串的编码与 content-type、转发不了的请求体退回直连（且只提示一次）、
   三个开关互不影响（只开「网页」时搜索请求仍直连）；
-- 传输层端到端：本地最小 CONNECT 代理 → `proxiedFetch` → 抓取 `myip.ipip.net` 成功，返回真实出口 IP；
+- 本地闭环：`FormData` 经代理链路送达时 boundary、`Content-Length`、字段与文件字节全部一致；
+  JSON / 字符串 / 表单请求体不受影响；
+- 传输层端到端：本地最小 CONNECT 代理 → `proxiedFetch` → HTTPS 端点，HTTP/2（ALPN h2）与 HTTP/1.1 两条路径都验证过
+  `multipart/form-data` 能完整送达并被服务端回显。
 - 用真实的 Windows 注册表状态（`ProxyEnable=0` + `ProxyServer` 残留）验证：判定为直连，不会向死端口发请求。
 
 **尚未验证**：没有在 DSH 宿主里实际加载运行过（首次提交时未做安装测试），宿主兼容性请以你的环境为准。
@@ -146,15 +162,41 @@ node test/tunnel.e2e.mjs     # 起一个本地最小 CONNECT 代理，验证隧�
 ```
 cordis.patch.yml      插件行声明
 lib/index.js          入口：schema、系统代理轮询、按类别路由、fetch 装/拆
-lib/classify.js       请求归类（搜索 / LLM / 网页）与三开关决策
+lib/classify.js       请求归类（搜索 / LLM / 网页）、图像端点与三开关决策
 lib/hosts.js          主机名解析与后缀匹配
+lib/provider-hosts.js 从 DSH 设置里发现模型网关主机（baseURL 键名宽松识别）
 lib/system-proxy.js   读取系统代理（Windows 注册表 / macOS scutil / Linux env）
 lib/proxy-fetch.js    代理客户端入口
-lib/proxy/            HTTP CONNECT / SOCKS5 / HTTP2 传输实现
+lib/proxy/            HTTP CONNECT / SOCKS5 / HTTP2 传输实现（含请求体编码）
 test/                 单测与端到端自检
 ```
 
 ## 更新日志
+
+### 0.2.2
+
+**修复：开了「网页走代理」后，插件里所有 `FormData` 请求直接失败**
+（现场是 dsh-image-gen 的图生图：`openai image edit request failed after 0.0s: Error [EBODY]:
+proxiedFetch: unsupported request body type: FormData`）。
+
+三个独立问题，任何一个都够把请求打死：
+
+1. **请求体白名单缺 `FormData`**。`normalizeBody()` 只认 string / Buffer / TypedArray / Blob /
+   `URLSearchParams` / Node 流，`FormData` 一律抛 `EBODY`。现在借 `new Request(url, { body })`
+   让 undici 自己编码，顺便拿到带 boundary 的 `content-type` 并写进请求头
+   （`Blob` 的 `type`、`URLSearchParams`、string 也按 fetch 语义补）。
+2. **转发不了就报错，而不是退回直连**。代理包装的是全进程 `globalThis.fetch`，
+   一次 `EBODY` 就等于某个插件功能整体失效。现在遇 `EBODY` 直接走 `originalFetch`（直连），
+   并在日志里按请求体类型提示一次。
+3. **归类漏了模型网关，图像端点还会被「网页」开关带走**。自动发现只认
+   `baseurl|base_url|apibase|api_base` 四个精确拼法，`openaiCompatBaseURL` 这种带插件前缀的写法一个都不命中；
+   主机没被发现时，`/v1/images/edits` 又被当成普通网页。现在：
+   - 键名按后缀宽松识别（`lib/provider-hosts.js`，并单独导出便于单测）；
+   - 新增路径判据：`/images/generations`、`/images/edits`、`/images/variations` 等端点直接归 LLM，
+     不依赖配置是否发现得到主机；
+   - 自动发现失败时日志会留一行线索（设置项数量），方便用 `llmHosts` 手填。
+
+新增 `test/bodies.e2e.mjs`（本地 forward proxy + origin 闭环，不联网），以及针对上面三点的单测。
 
 ### 0.2.0
 
@@ -171,6 +213,23 @@ test/                 单测与端到端自检
 - 页面底部新增「诊断信息」，直接显示宿主返回的快照，便于定位；
 - 宿主侧 `/_dsh/auto-proxy` 路由保留（`dsh web` 浏览器模式仍可用），并补上 CORS 与 OPTIONS 预检。
 ## FAQ
+
+**Q：开了「网页走代理」之后，dsh-image-gen 的图生图报 `proxiedFetch: unsupported request body type: FormData`？**
+
+0.2.2 已修。原因有三层：代理层不认 `FormData` 请求体、转发不了时直接抛错而不是退回直连、
+图像端点 `/v1/images/edits` 在网关主机没被发现时被归成「网页」类。修好后：图像端点直接归 LLM（跟「LLM 走代理」开关走），
+`FormData` 能正常转发，即使再遇到转发不了的请求体也会直连而不是失败。
+
+临时绕过（旧版本）：把「网页走代理」关掉，或把网关主机写进 `noProxy`：
+
+```yaml
+config:
+  noProxy:
+    - 127.0.0.1
+    - localhost
+    - ::1
+    - api.fanfanhenkuai.com   # 你的模型/生图网关
+```
 
 **Q：开了「网页走代理」之后，DSH 的「思考过程翻译」显示「翻译暂不可用」？**
 

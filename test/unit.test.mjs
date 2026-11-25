@@ -2,7 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { parseRegValues, parseProxyServer, parseBypassList } from "../lib/system-proxy.js";
 import { hostnameOf, matchesHost, parseTarget } from "../lib/hosts.js";
-import { classify, isSearchPath, decideProxy } from "../lib/classify.js";
+import { classify, isSearchPath, isModelPath, decideProxy } from "../lib/classify.js";
+import { providerHostsFrom, isBaseUrlKey } from "../lib/provider-hosts.js";
+import { normalizeBody, proxiedFetch } from "../lib/proxy/request.js";
 
 const SAMPLE = `
 HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings
@@ -95,6 +97,96 @@ test("isSearchPath 只认 Search/Fetch 工具端点", () => {
   assert.equal(isSearchPath("/v1/tools/search"), true);
   assert.equal(isSearchPath("/v1/tools/fetch"), true);
   assert.equal(isSearchPath("/v1/chat/completions"), false);
+});
+
+test("classify：图像端点归 LLM，不依赖网关主机是否被发现", () => {
+  // 回归：图生图（multipart 发 /v1/images/edits）曾被归成「网页」类
+  assert.equal(isModelPath("/v1/images/edits"), true);
+  assert.equal(isModelPath("/v1/images/generations"), true);
+  assert.equal(isModelPath("/v1/images/variations"), true);
+  assert.equal(isModelPath("/v1/chat/completions"), false);
+
+  // 主机没被发现时，路径兜底仍然把它归到 LLM
+  assert.equal(classify("relay.unknown.example", "/v1/images/edits", {}), "llm");
+  assert.equal(classify("relay.unknown.example", "/v1/images/generations", { llmHosts: [] }), "llm");
+  // 同主机的对话端点该归「网页」（没人知道它是网关），保持旧行为
+  assert.equal(classify("relay.unknown.example", "/v1/chat/completions", {}), "web");
+  // 发现到主机之后，整台网关都是 LLM
+  assert.equal(classify("relay.unknown.example", "/v1/chat/completions", { llmHosts: ["relay.unknown.example"] }), "llm");
+});
+
+test("providerHostsFrom：带插件前缀的 baseURL 键名也要认得", () => {
+  assert.equal(isBaseUrlKey("openaiCompatBaseURL"), true); // dsh-image-gen 的写法（漏认过一次）
+  assert.equal(isBaseUrlKey("baseURL"), true);
+  assert.equal(isBaseUrlKey("base_url"), true);
+  assert.equal(isBaseUrlKey("apiBase"), true);
+  assert.equal(isBaseUrlKey("api_base"), true);
+  assert.equal(isBaseUrlKey("downloadUrl"), false);
+  assert.equal(isBaseUrlKey("baseURLs"), false);
+
+  const descriptors = [
+    { id: "image-gen", value: { openaiCompatBaseURL: "https://api.fanfanhenkuai.com/v1", openaiCompatModel: "gpt-image-2.6-sunburst" } },
+    { id: "llm-pi-ai", value: { providers: { fanfan: { baseURL: "https://api.fanfanhenkuai.com/v1" }, other: { api_base: "https://relay.example.com/v1" } } } },
+    { id: "noise", value: { downloadUrl: "https://cdn.example.com/x", baseURLs: "https://not-a-base.example.com" } },
+    { id: "junk", value: null },
+  ];
+  assert.deepEqual(providerHostsFrom(descriptors).sort(), ["api.fanfanhenkuai.com", "relay.example.com"]);
+  assert.deepEqual(providerHostsFrom([]), []);
+  assert.deepEqual(providerHostsFrom(undefined), []);
+});
+
+test("normalizeBody：FormData 编码出带 boundary 的字节与 content-type", async () => {
+  const form = new FormData();
+  form.append("model", "gpt-image-2.6-sunburst");
+  form.append("prompt", "a sailboat");
+  form.append("image", new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" }), "a.png");
+
+  const { body, contentType } = await normalizeBody(form);
+  assert.match(contentType, /^multipart\/form-data; boundary=/);
+  const boundary = contentType.split("boundary=")[1];
+  const text = body.toString("latin1");
+  assert.ok(text.startsWith(`--${boundary}`), "请求体应以同一个 boundary 开头");
+  assert.ok(text.endsWith(`--${boundary}--\r\n`), "请求体应以终止 boundary 收尾");
+  assert.match(text, /name="model"/i);
+  assert.match(text, /gpt-image-2\.6-sunburst/);
+  assert.match(text, /filename="a\.png"/i);
+  assert.match(text, /image\/png/i);
+});
+
+test("normalizeBody：其它类型按 fetch 语义补 content-type，未知类型报 EBODY", async () => {
+  assert.deepEqual(await normalizeBody("hi"), { body: "hi", contentType: "text/plain;charset=UTF-8" });
+  assert.deepEqual(await normalizeBody(new URLSearchParams({ a: "1" })), {
+    body: "a=1",
+    contentType: "application/x-www-form-urlencoded;charset=UTF-8",
+  });
+  assert.equal((await normalizeBody(Buffer.from("x"))).contentType, null);
+  assert.equal((await normalizeBody(null)).body, null);
+  await assert.rejects(() => normalizeBody({ not: "a body" }), (e) => e.code === "EBODY");
+  await assert.rejects(() => normalizeBody(new ReadableStream()), (e) => e.code === "EBODY");
+});
+
+test("proxiedFetch：转发不了的请求体退回直连，绝不让代理打死请求", async () => {
+  const calls = [];
+  const stubFetch = async (url, init) => {
+    calls.push({ url: String(url), init });
+    return new Response("direct-ok", { status: 200 });
+  };
+  const proxy = { protocol: "http", host: "127.0.0.1", port: 1, noProxy: [], timeout: 1000 };
+  const warnings = [];
+  const warn = (message) => warnings.push(String(message));
+
+  const stream = () => new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1])); c.close(); } });
+  const res = await proxiedFetch("https://example.com/upload", { method: "POST", body: stream(), duplex: "half" }, proxy, stubFetch, null, warn);
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), "direct-ok");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://example.com/upload");
+  assert.match(warnings[0], /退回直连/);
+
+  // 同类请求体只提示一次，不刷日志
+  await proxiedFetch("https://example.com/upload2", { method: "POST", body: stream(), duplex: "half" }, proxy, stubFetch, null, warn);
+  assert.equal(warnings.length, 1);
+  assert.equal(calls.length, 2);
 });
 
 test("decideProxy：三个开关互不影响", () => {
