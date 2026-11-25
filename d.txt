@@ -1,0 +1,177 @@
+diff --git a/lib/index.js b/lib/index.js
+index 00a6db2..088b357 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -26,6 +26,17 @@ export const inject = [];
+ 
+ const SWITCH_KEYS = ["proxySearch", "proxyLLM", "proxyWeb"];
+ 
++/** 认领自家的 fetch 包装器；Symbol.for 保证跨插件重载仍是同一个键。 */
++const WRAPPER_FLAG = Symbol.for("dsh.auto-proxy.fetch-wrapper");
++const WRAPPER_SOURCE = Symbol.for("dsh.auto-proxy.fetch-wrapper.source");
++
++/** 跳过历史上没拆干净的自家包装层，拿到最底层的真实 fetch（避免自我叠加成深链）。 */
++function unwrapOwnLayers(current) {
++  let base = current;
++  for (let i = 0; i < 8 && base && base[WRAPPER_FLAG] && base[WRAPPER_SOURCE]; i++) base = base[WRAPPER_SOURCE];
++  return base;
++}
++
+ export const Config = z
+   .object({
+     proxyLLM: z
+@@ -68,7 +79,14 @@ export const Config = z
+       .min(1000)
+       .max(600000)
+       .default(60000)
+-      .description("单次经代理请求的超时（毫秒）。"),
++      .description("单次经代理请求的连接/握手超时（毫秒）。"),
++    llmTimeout: z
++      .number()
++      .step(1000)
++      .min(0)
++      .max(3600000)
++      .default(600000)
++      .description("LLM 类请求等待响应的上限（毫秒），0 表示不限；连接与握手仍用 timeout。生图这类请求要几十秒到几分钟才回第一个字节。"),
+   })
+   .default({});
+ 
+@@ -95,6 +113,11 @@ export function apply(ctx, config) {
+ 
+   const llmHosts = () => [...new Set([...(Array.isArray(cfg.llmHosts) ? cfg.llmHosts : []), ...discoveredLlmHosts])];
+   const anySwitchOn = () => Boolean(cfg.proxyLLM || cfg.proxySearch || cfg.proxyWeb);
++  /** LLM 类请求等响应的上限：0 = 不限（交给调用方的 AbortSignal）。 */
++  const llmResponseTimeout = () => {
++    const value = Number(cfg.llmTimeout);
++    return Number.isFinite(value) && value >= 0 ? value : 600000;
++  };
+ 
+   /** 当前系统代理；返回 null 表示此刻任何请求都不该被代理。 */
+   function activeProxy() {
+@@ -124,7 +147,10 @@ export function apply(ctx, config) {
+       searchHosts: Array.isArray(cfg.searchHosts) ? cfg.searchHosts : [],
+       llmHosts: llmHosts(),
+     });
+-    if (decideProxy(category, cfg)) return proxy;
++    if (decideProxy(category, cfg)) {
++      // 按归类给「等响应」的上限：LLM/生图可能分钟级才有响应头，搜索/网页仍用短超时
++      return { ...proxy, responseTimeout: category === "llm" ? llmResponseTimeout() : proxy.timeout };
++    }
+ 
+     // 归类为"网页"且网页开关没开：提示一次，避免用户误以为代理失效
+     if (category === "web" && !cfg.proxyWeb && !reportedUnknown.has(hostname) && reportedUnknown.size < 20) {
+@@ -134,38 +160,42 @@ export function apply(ctx, config) {
+     return null;
+   }
+ 
+-  /** 系统代理可用性变化时，装 / 拆 fetch 包装器。 */
++  /**
++   * 只装一次 fetch 包装器，之后再不随系统代理开关装拆。
++   *
++   * 包装器本身按请求决策（没代理就原样直连），拆掉没有收益。而反复改写
++   * `globalThis.fetch` 会让同样改 fetch 的插件（例如 DSH 的
++   * `experimental-inspector`，它靠「快照 / 栈顶还原」管理自己的包装层）错位：
++   * 还原时发现栈顶不是自己就放弃，旧层留在链上，宿主下次再装又叠一层。
++   * 本次 DSH 崩溃的栈全部在 inspector 内部（不是本插件），但少改一次全局
++   * fetch，就少一次把别人链路搞乱的机会——包装器越少换手，越稳。
++   */
+   function sync() {
+     if (disposed) return;
+     const proxy = activeProxy();
+-    if (proxy) {
+-      if (!wrapper) {
+-        originalFetch = globalThis.fetch;
+-        wrapper = (input, init) => {
+-          const chosen = routeFor(input);
+-          // warn 传给底层：请求体转发不了时它要提示一次「已退回直连」
+-          return chosen ? proxiedFetch(input, init, chosen, originalFetch, null, warn) : originalFetch(input, init);
+-        };
+-        globalThis.fetch = wrapper;
+-        info(
+-          `[auto-proxy] 跟随系统代理：${proxy.protocol}://${proxy.host}:${proxy.port}` +
+-            `（搜索 ${cfg.proxySearch ? "走代理" : "直连"} / LLM ${cfg.proxyLLM ? "走代理" : "直连"}` +
+-            ` / 网页 ${cfg.proxyWeb ? "走代理" : "直连"}）`
+-        );
+-        if (cfg.proxyLLM && llmHosts().length === 0) {
+-          warn("[auto-proxy] LLM 开关已打开，但没识别到模型网关域名；请在 llmHosts 里手填（例如 api.example.com）");
+-        }
++    if (proxy && !wrapper) {
++      const current = globalThis.fetch;
++      // 上一个实例没拆干净：跳过自家遗留层，别自我叠加
++      originalFetch = current && current[WRAPPER_FLAG] ? unwrapOwnLayers(current) : current;
++      wrapper = (input, init) => {
++        const chosen = routeFor(input);
++        // warn 传给底层：请求体转发不了时它要提示一次「已退回直连」
++        return chosen ? proxiedFetch(input, init, chosen, originalFetch, null, warn) : originalFetch(input, init);
++      };
++      wrapper[WRAPPER_FLAG] = true;
++      wrapper[WRAPPER_SOURCE] = originalFetch;
++      globalThis.fetch = wrapper;
++      info(
++        `[auto-proxy] 跟随系统代理：${proxy.protocol}://${proxy.host}:${proxy.port}` +
++          `（搜索 ${cfg.proxySearch ? "走代理" : "直连"} / LLM ${cfg.proxyLLM ? "走代理" : "直连"}` +
++          ` / 网页 ${cfg.proxyWeb ? "走代理" : "直连"}）`
++      );
++      if (cfg.proxyLLM && llmHosts().length === 0) {
++        warn("[auto-proxy] LLM 开关已打开，但没识别到模型网关域名；请在 llmHosts 里手填（例如 api.example.com）");
+       }
+       return;
+     }
+-    if (!wrapper) return;
+-    if (globalThis.fetch === wrapper) {
+-      globalThis.fetch = originalFetch;
+-      info("[auto-proxy] 系统代理不可用或三个开关都关了，已恢复直连。");
+-    } else {
+-      warn("[auto-proxy] 全局 fetch 已被其他插件包装，未强行拆除；代理可能仍在部分链路生效。");
+-    }
+-    wrapper = null;
++    if (!proxy && wrapper) info("[auto-proxy] 系统代理不可用或三个开关都关了：后续请求直连（包装器保留，不再装拆）");
+   }
+ 
+   async function refresh() {
+diff --git a/lib/proxy/request.js b/lib/proxy/request.js
+index ac7b21f..9f68c7b 100644
+--- a/lib/proxy/request.js
++++ b/lib/proxy/request.js
+@@ -82,6 +82,12 @@ async function proxiedOnce(url, init = {}, proxy, originalFetch, log) {
+   const { body, contentType } = await normalizeBody(init.body == null ? null : init.body);
+   const signal = init.signal;
+   const timeoutMs = timeoutFor(proxy);
++  // 响应阶段的等待上限可以比「连接/握手」长得多：生图这类请求在服务端算几十秒到几分钟
++  // 都不回一个字节，用 60s 的连接超时去量它们就是必死。`proxy.responseTimeout` 由调用方
++  // 按请求类别给出；缺省沿用 timeout，0 表示不限（由调用方的 AbortSignal 兜底）。
++  const responseTimeoutMs = proxy && proxy.responseTimeout != null
++    ? Math.max(0, Number(proxy.responseTimeout) || 0)
++    : timeoutMs;
+ 
+   // 流量日志：一条请求一条记录（含 noProxy 直连），body 流结束/取消/出错时收尾。
+   const entry = log ? log.begin({ kind: "fetch", method, url }) : null;
+@@ -206,12 +212,12 @@ async function proxiedOnce(url, init = {}, proxy, originalFetch, log) {
+     }
+     if (tlsSock.alpnProtocol === "h2") {
+       // C2：服务器协商出 HTTP/2 → 走 HTTP/2；否则回退 HTTP/1.1
+-      return sendViaHttp2(tlsSock, targetHost, targetPort, hostHeader, urlObj, method, headers, body, signal, { timeoutMs, entry });
++      return sendViaHttp2(tlsSock, targetHost, targetPort, hostHeader, urlObj, method, headers, body, signal, { timeoutMs: responseTimeoutMs, entry });
+     }
+     const path = urlObj.pathname + urlObj.search;
+     const h = { Host: hostHeader, Connection: "close", ...headers };
+     const head = `${method} ${path} HTTP/1.1\r\n${Object.entries(h).map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n`;
+-    return sendViaSocket(tlsSock, url, head, body, { signal, timeoutMs, entry });
++    return sendViaSocket(tlsSock, url, head, body, { signal, timeoutMs: responseTimeoutMs, entry });
+   }
+ 
+   // HTTP 目标：Host + 绝对 URL；HTTP 代理有凭据时补 Proxy-Authorization（A3）。
+@@ -234,11 +240,11 @@ async function proxiedOnce(url, init = {}, proxy, originalFetch, log) {
+   }
+   if (isSocks) {
+     const socksHead = `${method} ${urlObj.pathname}${urlObj.search} HTTP/1.1\r\n${Object.entries(h).map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n`;
+-    return sendViaSocket(raw, url, socksHead, body, { signal, timeoutMs, entry });
++    return sendViaSocket(raw, url, socksHead, body, { signal, timeoutMs: responseTimeoutMs, entry });
+   }
+   const absUrl = `${urlObj.protocol}//${urlObj.host}${urlObj.pathname}${urlObj.search}`;
+   const httpHead = `${method} ${absUrl} HTTP/1.1\r\n${Object.entries(h).map(([k, v]) => `${k}: ${v}`).join("\r\n")}\r\n\r\n`;
+-  return sendViaSocket(raw, url, httpHead, body, { signal, timeoutMs, entry });
++  return sendViaSocket(raw, url, httpHead, body, { signal, timeoutMs: responseTimeoutMs, entry });
+ }
+ 
+ // 外层：跟随 30x 重定向（最多 5 跳），对齐标准 fetch。

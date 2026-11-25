@@ -95,7 +95,11 @@ dsh plugin --profile <你的profile> add github:<你的用户名>/dsh-auto-proxy
 | `llmHosts` | `[]` | 额外追加的"LLM"域名；留空时自动从 provider 的 `baseURL` 发现。 |
 | `noProxy` | `["127.0.0.1","localhost","::1"]` | 命中则直连；系统绕过列表自动并入。 |
 | `pollIntervalMs` | `3000` | 读取系统代理的间隔（1000–60000 毫秒）。 |
-| `timeout` | `60000` | 单次经代理请求的超时（毫秒）。 |
+| `timeout` | `60000` | 连接 / TLS 握手 / 代理握手的超时（毫秒）。 |
+| `llmTimeout` | `600000` | LLM 类请求**等响应**的上限（毫秒），`0` = 不限。生图这类请求要几十秒到几分钟才有第一个字节，不能用连接超时去量。 |
+
+> 超时是两个口径：`timeout` 只量「连不上」，`llmTimeout` 量「连上了但还没回话」。
+> 搜索/网页类请求的等待上限沿用 `timeout`；LLM 类（含 `/images/edits` 这类生图端点）用 `llmTimeout`。
 
 匹配规则：`example.com` 命中本体及所有子域，`.example.com` 同义，`*` 命中全部。
 
@@ -138,9 +142,11 @@ node test/tunnel.e2e.mjs     # 起一个本地最小 CONNECT 代理，验证隧�
   `FormData`/`URLSearchParams`/字符串的编码与 content-type、转发不了的请求体退回直连（且只提示一次）、
   三个开关互不影响（只开「网页」时搜索请求仍直连）；
 - 本地闭环：`FormData` 经代理链路送达时 boundary、`Content-Length`、字段与文件字节全部一致；
-  JSON / 字符串 / 表单请求体不受影响；
+  JSON / 字符串 / 表单请求体不受影响；慢响应（300ms 才回）在 `responseTimeout` 放宽 / 置 0 时正常返回，
+  收紧到 100ms 时按 `ETIMEOUT` 失败；
 - 传输层端到端：本地最小 CONNECT 代理 → `proxiedFetch` → HTTPS 端点，HTTP/2（ALPN h2）与 HTTP/1.1 两条路径都验证过
-  `multipart/form-data` 能完整送达并被服务端回显。
+  `multipart/form-data` 能完整送达并被服务端回显；h2 路径的等响应上限确认走 `responseTimeout`
+  （`80ms` → `HTTP/2 request timeout after 80ms`；`20000ms` → 正常 200 并回显表单）。
 - 用真实的 Windows 注册表状态（`ProxyEnable=0` + `ProxyServer` 残留）验证：判定为直连，不会向死端口发请求。
 
 **尚未验证**：没有在 DSH 宿主里实际加载运行过（首次提交时未做安装测试），宿主兼容性请以你的环境为准。
@@ -172,6 +178,29 @@ test/                 单测与端到端自检
 ```
 
 ## 更新日志
+
+### 0.2.3
+
+**修复：开了「LLM 走代理」后，dsh-image-gen 的图生图在 60 秒整报
+`Error [ETIMEOUT]: HTTP/2 request timeout after 60000ms`。**
+
+代理把 `timeout`（连接超时，默认 60s）当成了「整个请求」的截止时间：h2 路径用一个
+从发出请求起算的定时器等响应头，h1 路径用 `ByteStream` 的空闲计时。可生图请求在服务端
+算几十秒到几分钟才回第一个字节——连接一直健康，只是没话说，于是被 60s 裁掉。
+
+拆成两个口径：
+
+- `timeout`：只量连接 / TLS 握手 / 代理握手；
+- `llmTimeout`（新配置，默认 600000，0 = 不限）：量「连上了但还没回响应」，
+  只对 LLM 类请求生效（含按路径识别的 `/images/edits` 等生图端点）。
+  搜索 / 网页类仍用 `timeout`，避免死连接长时间占着。
+
+另外把 fetch 包装器的装拆改稳了：**只装一次，之后不再随系统代理开关来回替换**。
+包装器本来就按请求决策（没代理时原样直连），拆掉没有收益；而反复改写
+`globalThis.fetch` 会让同样改 fetch 的插件（例如 DSH 的 `experimental-inspector`，
+它靠「快照 / 栈顶还原」管理包装层）错位，旧层留在链上越叠越深，最终一次 `fetch`
+就可能 `Maximum call stack size exceeded`。多插件共用 `globalThis.fetch` 时，
+谁少换手一次，链条就少一次错位的机会。
 
 ### 0.2.2
 
@@ -213,6 +242,23 @@ proxiedFetch: unsupported request body type: FormData`）。
 - 页面底部新增「诊断信息」，直接显示宿主返回的快照，便于定位；
 - 宿主侧 `/_dsh/auto-proxy` 路由保留（`dsh web` 浏览器模式仍可用），并补上 CORS 与 OPTIONS 预检。
 ## FAQ
+
+**Q：图生图报 `Error [ETIMEOUT]: HTTP/2 request timeout after 60000ms`？**
+
+0.2.3 已修。旧版本把 `timeout`（连接超时，60s）当成了整个请求的截止时间，而服务端生图
+要几十秒到几分钟才回第一个字节。升级后 LLM 类请求等响应用 `llmTimeout`（默认 10 分钟，
+`0` 表示不限），搜索/网页仍用 `timeout`。想继续用旧版本，就把 `timeout` 调大（比如 `600000`），
+或者干脆关掉「LLM 走代理」让生图直连。
+
+**Q：用着用着 DSH 宿主直接崩了，日志里是 `Maximum call stack size exceeded`？**
+
+先看崩溃现场：`%APPDATA%\@deepseek-ai\dsh-desktop\logs\crash-*-host.log`。
+如果栈里反复出现 `@deepseek-ai/dsh-experimental-inspector` 的 fetch 观察器
+（`Reflect.apply(original, ...)` / `return response`），那是 inspector 的 fetch 包装层
+叠了太多层——它靠「安装时快照、卸载时栈顶还原」管理包装器，一旦栈顶已被别的插件换过，
+还原就放弃，旧层永久留在链上。修法是关掉不用的 Inspector 面板 / 不再加载
+`@deepseek-ai/dsh-experimental-inspector-profile` 这个 bundle，然后重启。
+本插件 0.2.3 起不再随开关换手 `globalThis.fetch`，减少这类错位，但源头在 inspector 那边。
 
 **Q：开了「网页走代理」之后，dsh-image-gen 的图生图报 `proxiedFetch: unsupported request body type: FormData`？**
 

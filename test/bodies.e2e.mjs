@@ -19,28 +19,33 @@ const origin = http.createServer((req, res) => {
     const text = body.toString("latin1");
     const contentType = String(req.headers["content-type"] || "");
     const boundary = /boundary=(.+)$/.exec(contentType)?.[1] || "";
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(
-      JSON.stringify({
-        method: req.method,
-        contentType,
-        length: body.length,
-        declaredLength: Number(req.headers["content-length"] || -1),
-        fields: {
-          model: /name="model"/i.test(text),
-          prompt: /name="prompt"/i.test(text),
-          image: /name="image"/i.test(text),
-          filename: /filename="a\.png"/i.test(text),
-          imageType: /image\/png/i.test(text),
-          pngMagic: body.includes(PNG_MAGIC),
-        },
-        boundary,
-        boundaryInBody: boundary ? text.includes(`--${boundary}`) : false,
-        bodyStart: text.slice(0, 24),
-        text: text.length < 400 ? text : "",
-        json: contentType.startsWith("application/json") ? text : "",
-      })
-    );
+    const reply = () => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          method: req.method,
+          contentType,
+          length: body.length,
+          declaredLength: Number(req.headers["content-length"] || -1),
+          fields: {
+            model: /name="model"/i.test(text),
+            prompt: /name="prompt"/i.test(text),
+            image: /name="image"/i.test(text),
+            filename: /filename="a\.png"/i.test(text),
+            imageType: /image\/png/i.test(text),
+            pngMagic: body.includes(PNG_MAGIC),
+          },
+          boundary,
+          boundaryInBody: boundary ? text.includes(`--${boundary}`) : false,
+          bodyStart: text.slice(0, 24),
+          text: text.length < 400 ? text : "",
+          json: contentType.startsWith("application/json") ? text : "",
+        })
+      );
+    };
+    // 慢端点：模拟生图这类「服务端算很久才回第一个字节」的请求
+    if (req.url.startsWith("/slow")) setTimeout(reply, 300);
+    else reply();
   });
 });
 
@@ -131,6 +136,19 @@ try {
   console.log("URLSearchParams 经代理：");
   check("自动补 form-urlencoded", paramsEcho.contentType === "application/x-www-form-urlencoded;charset=UTF-8", paramsEcho.contentType);
   check("body 是编码后的表单", paramsEcho.text === "grant_type=client_credentials", paramsEcho.text);
+
+  // 5) 慢响应：responseTimeout 决定「等响应」的上限（连接超时不该拿来量生图）
+  const slowUrl = `http://127.0.0.1:${originPort}/slow`;
+  console.log("慢响应（300ms 才回）：");
+  const relaxed = await proxiedFetch(slowUrl, {}, { ...proxyConfig, responseTimeout: 5000 }, globalThis.fetch);
+  check("上限放宽后正常返回", relaxed.status === 200, relaxed.status);
+  const unlimited = await proxiedFetch(slowUrl, {}, { ...proxyConfig, responseTimeout: 0 }, globalThis.fetch);
+  check("responseTimeout=0 表示不限", unlimited.status === 200, unlimited.status);
+  const tight = await proxiedFetch(slowUrl, {}, { ...proxyConfig, responseTimeout: 100 }, globalThis.fetch).then(
+    () => "resolved",
+    (error) => error.code || error.message
+  );
+  check("上限收紧后按 responseTimeout 超时", tight === "ETIMEOUT", tight);
 } catch (error) {
   failed += 1;
   console.error("请求抛错 ->", error);
